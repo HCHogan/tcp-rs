@@ -1,3 +1,5 @@
+mod refs;
+
 use std::io;
 use tun_tap::{Iface, Mode};
 
