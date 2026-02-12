@@ -45,8 +45,8 @@ fn main() -> io::Result<()> {
                                 src: (src, src_port),
                                 dst: (dst, dst_port),
                             })
-                            .or_default()
-                            .on_packet(iph, tcph, &buf[datai..nbytes]);
+                            .or_default() // assume all ports are listening now
+                            .on_packet(&nic, iph, tcph, &buf[datai..nbytes])?;
                     }
 
                     Err(e) => {
