@@ -1,5 +1,6 @@
 mod refs;
 mod tcp;
+mod t1;
 
 use etherparse::{IpNumber, Ipv4HeaderSlice, TcpHeaderSlice};
 use std::collections::HashMap;
@@ -36,7 +37,7 @@ fn main() -> io::Result<()> {
                 };
                 match TcpHeaderSlice::from_slice(&buf[4 + iph.slice().len()..nbytes]) {
                     Ok(tcph) => {
-                        let datai = 4 + iph.slice().len() + tcph.slice().len();
+                        let datai = 5 + iph.slice().len() + tcph.slice().len();
                         let src_port = tcph.source_port();
                         let dst_port = tcph.destination_port();
 

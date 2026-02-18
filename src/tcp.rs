@@ -17,6 +17,11 @@ impl Default for TcpState {
     }
 }
 
+#[derive(Default, Debug)]
+pub struct Connection {
+    state: TcpState
+}
+
 impl TcpState {
     pub fn on_packet<'a>(
         &mut self,
