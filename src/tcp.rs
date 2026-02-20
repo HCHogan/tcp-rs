@@ -19,10 +19,71 @@ impl Default for TcpState {
 
 #[derive(Default, Debug)]
 pub struct Connection {
-    state: TcpState
+    state: TcpState,
+    send: SendSequenceSpace,
+    recv: RecvSequenceSpace,
 }
 
-impl TcpState {
+/// ```text
+/// Send Sequence Space
+///
+///            1         2          3          4
+///       ----------|----------|----------|----------
+///              SND.UNA    SND.NXT    SND.UNA
+///                                   +SND.WND
+///
+/// 1 - old sequence numbers which have been acknowledged
+/// 2 - sequence numbers of unacknowledged data
+/// 3 - sequence numbers allowed for new data transmission
+/// 4 - future sequence numbers which are not yet allowed
+///
+///                   Send Sequence Space
+/// ```
+#[derive(Debug)]
+struct SendSequenceSpace {
+    /// send unacknowledged
+    una: usize,
+    /// send next
+    nxt: usize,
+    /// send window
+    wnd: usize,
+    /// send urgent pointer
+    up: bool,
+    /// segment sequence number used for last window update
+    wl1: usize,
+    /// segment acknowledgement number for last window update
+    wl2: usize,
+    /// initial send sequence number
+    iss: usize,
+}
+
+/// ```text
+/// Receive Sequence Space
+///
+///                1          2          3
+///            ----------|----------|----------
+///                   RCV.NXT    RCV.NXT
+///                             +RCV.WND
+///
+/// 1 - old sequence numbers which have been acknowledged
+/// 2 - sequence numbers allowed for new reception
+/// 3 - future sequence numbers which are not yet allowed
+///
+///                  Receive Sequence Space
+/// ```
+#[derive(Debug)]
+struct RecvSequenceSpace {
+    /// receive next
+    nxt: usize,
+    /// receive window
+    snd: usize,
+    /// receive urgent pointer
+    up: bool,
+    /// initial receive sequence number
+    irs: usize,
+}
+
+impl Connection {
     pub fn on_packet<'a>(
         &mut self,
         nic: &Iface,
@@ -30,7 +91,7 @@ impl TcpState {
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<usize> {
-        match *self {
+        match self.state {
             TcpState::Closed => {
                 return Ok(0);
             }
