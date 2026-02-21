@@ -4,24 +4,27 @@ use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlic
 use tun_tap::Iface;
 
 #[derive(Debug)]
-pub enum TcpState {
+pub enum Connection {
     Closed,
-    Listen,
-    SynRcvd,
-    Estab,
-}
-
-impl Default for TcpState {
-    fn default() -> Self {
-        TcpState::Listen
-    }
+    Listen(ListenerState),
+    Active(ActiveSocket),
 }
 
 #[derive(Default, Debug)]
-pub struct Connection {
-    state: TcpState,
+pub struct ListenerState {}
+
+#[derive(Debug)]
+pub struct ActiveSocket {
+    state: ActiveState,
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
+}
+
+#[derive(Debug)]
+pub enum ActiveState {
+    SynSent,
+    SynRcvd,
+    Estab,
 }
 
 /// ```text
@@ -42,19 +45,19 @@ pub struct Connection {
 #[derive(Debug)]
 struct SendSequenceSpace {
     /// send unacknowledged
-    una: usize,
+    una: u32,
     /// send next
-    nxt: usize,
+    nxt: u32,
     /// send window
-    wnd: usize,
+    wnd: u32,
     /// send urgent pointer
     up: bool,
     /// segment sequence number used for last window update
-    wl1: usize,
+    wl1: u32,
     /// segment acknowledgement number for last window update
-    wl2: usize,
+    wl2: u32,
     /// initial send sequence number
-    iss: usize,
+    iss: u32,
 }
 
 /// ```text
@@ -74,16 +77,72 @@ struct SendSequenceSpace {
 #[derive(Debug)]
 struct RecvSequenceSpace {
     /// receive next
-    nxt: usize,
+    nxt: u32,
     /// receive window
-    snd: usize,
+    wnd: u16,
     /// receive urgent pointer
     up: bool,
     /// initial receive sequence number
-    irs: usize,
+    irs: u32,
 }
 
 impl Connection {
+    pub fn accept<'a>(
+        nic: &Iface,
+        iph: Ipv4HeaderSlice<'a>,
+        tcph: TcpHeaderSlice<'a>,
+        data: &'a [u8],
+    ) -> io::Result<Option<Self>> {
+        if !tcph.syn() {
+            return Ok(None); // only expected syn packets
+        }
+
+        let iss = 0;
+        let mut c = Connection::Active(ActiveSocket {
+            state: ActiveState::SynRcvd,
+            send: SendSequenceSpace {
+                una: iss,
+                nxt: iss + 1,
+                wnd: 10,
+                up: false,
+                wl1: 0,
+                wl2: 0,
+                iss,
+            },
+            recv: RecvSequenceSpace {
+                nxt: tcph.sequence_number() + 1,
+                wnd: tcph.window_size(),
+                up: false,
+                irs: tcph.sequence_number(),
+            },
+        });
+
+        // snd syn,ack -> syn rcvd
+        let mut syn_ack = TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, 10);
+        syn_ack.acknowledgment_number = tcph.sequence_number() + 1;
+        syn_ack.syn = true;
+        syn_ack.ack = true;
+        let Ok(ip) = Ipv4Header::new(
+            syn_ack.header_len_u16(),
+            64,
+            IpNumber::TCP,
+            iph.destination(),
+            iph.source(),
+        ) else {
+            eprintln!("ipv4 header new error");
+            return Ok(None);
+        };
+        let mut buf = [0u8; 1500];
+        let unwritten = {
+            let mut unwritten = &mut buf[..];
+            ip.write(&mut unwritten);
+            syn_ack.write(&mut unwritten);
+            unwritten.len()
+        };
+        nic.send(&buf[..buf.len() - unwritten]);
+        Ok(Some(c))
+    }
+
     pub fn on_packet<'a>(
         &mut self,
         nic: &Iface,
@@ -91,59 +150,7 @@ impl Connection {
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
     ) -> io::Result<usize> {
-        match self.state {
-            TcpState::Closed => {
-                return Ok(0);
-            }
-
-            TcpState::Listen => {
-                if !tcph.syn() {
-                    return Ok(0); // only expected syn packets
-                }
-
-                // snd syn,ack -> syn rcvd
-                let mut syn_ack = TcpHeader::new(
-                    tcph.destination_port(),
-                    tcph.source_port(),
-                    unimplemented!(),
-                    unimplemented!(),
-                );
-                syn_ack.syn = true;
-                syn_ack.ack = true;
-                let Ok(mut ip) = Ipv4Header::new(
-                    syn_ack.header_len_u16(),
-                    64,
-                    IpNumber::TCP,
-                    iph.destination(),
-                    iph.source(),
-                ) else {
-                    eprintln!("ipv4 header new error");
-                    return Ok(0);
-                };
-                let mut buf = [0u8; 1500];
-                let unwritten = {
-                    let mut unwritten = &mut buf[..];
-                    ip.write(&mut unwritten);
-                    syn_ack.write(&mut unwritten);
-                    unwritten.len()
-                };
-                nic.send(&buf[..buf.len() - unwritten]);
-            }
-
-            _ => {
-                return Ok(0);
-            }
-        }
-
-        let src = iph.source_addr();
-        let dst = iph.destination_addr();
-        let src_port = tcph.source_port();
-        let dst_port = tcph.destination_port();
-        let len = data.len();
-        eprintln!(
-            "{}:{} -> {}:{} {}b of tcp",
-            src, dst, src_port, dst_port, len
-        );
+        Ok(0)
     }
 }
 

@@ -4,13 +4,14 @@ mod tcp;
 
 use etherparse::{IpNumber, Ipv4HeaderSlice, TcpHeaderSlice};
 use std::collections::HashMap;
+use std::collections::hash_map::Entry;
 use std::io;
 use tun_tap::{Iface, Mode};
 
 use crate::tcp::{Connection, Quad};
 
 fn main() -> io::Result<()> {
-    let nic = Iface::new("tun0", Mode::Tun)?;
+    let mut nic = Iface::new("tun0", Mode::Tun)?;
     let mut buf = [0u8; 1504];
     let mut connections: HashMap<Quad, Connection> = Default::default();
     loop {
@@ -48,12 +49,19 @@ fn main() -> io::Result<()> {
         let src_port = tcph.source_port();
         let dst_port = tcph.destination_port();
 
-        connections
-            .entry(Quad {
-                src: (src, src_port),
-                dst: (dst, dst_port),
-            })
-            .or_default() // assume all ports are listening now
-            .on_packet(&nic, iph, tcph, &buf[datai..nbytes])?;
+        match connections.entry(Quad {
+            src: (src, src_port),
+            dst: (dst, dst_port),
+        }) {
+            Entry::Occupied(mut c) => {
+                c.get_mut()
+                    .on_packet(&mut nic, iph, tcph, &buf[datai..nbytes])?;
+            }
+            Entry::Vacant(e) => {
+                if let Some(c) = Connection::accept(&mut nic, iph, tcph, &buf[datai..nbytes])? {
+                    e.insert(c);
+                }
+            }
+        }
     }
 }
