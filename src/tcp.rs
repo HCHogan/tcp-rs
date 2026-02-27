@@ -1,26 +1,77 @@
-use std::{io, net::Ipv4Addr};
+use std::{
+    io::{self, Write},
+    net::Ipv4Addr,
+};
 
 use etherparse::{IpNumber, Ipv4Header, Ipv4HeaderSlice, TcpHeader, TcpHeaderSlice};
 use tun_tap::Iface;
 
-#[derive(Debug)]
+///                      TCP Connection State Diagram
+///
+///                              +---------+ ---------\      active OPEN
+///                              |  CLOSED |            \    -----------
+///                              +---------+<---------\   \   create TCB
+///                                |     ^              \   \  snd SYN
+///                   passive OPEN |     |   CLOSE        \   \
+///                   ------------ |     | ----------       \   \
+///                    create TCB  |     | delete TCB         \   \
+///                                V     |                      \   \
+///                              +---------+            CLOSE    |    \
+///                              |  LISTEN |          ---------- |     |
+///                              +---------+          delete TCB |     |
+///                   rcv SYN      |     |     SEND              |     |
+///                  -----------   |     |    -------            |     V
+/// +---------+      snd SYN,ACK  /       \   snd SYN          +---------+
+/// |         |<-----------------           ------------------>|         |
+/// |   SYN   |                    rcv SYN                     |   SYN   |
+/// |   RCVD  |<-----------------------------------------------|   SENT  |
+/// |         |                    snd ACK                     |         |
+/// |         |------------------           -------------------|         |
+/// +---------+   rcv ACK of SYN  \       /  rcv SYN,ACK       +---------+
+///   |           --------------   |     |   -----------
+///   |                  x         |     |     snd ACK
+///   |                            V     V
+///   |  CLOSE                   +---------+
+///   | -------                  |  ESTAB  |
+///   | snd FIN                  +---------+
+///   |                   CLOSE    |     |    rcv FIN
+///   V                  -------   |     |    -------
+/// +---------+          snd FIN  /       \   snd ACK          +---------+
+/// |  FIN    |<-----------------           ------------------>|  CLOSE  |
+/// | WAIT-1  |------------------                              |   WAIT  |
+/// +---------+          rcv FIN  \                            +---------+
+///   | rcv ACK of FIN   -------   |                            CLOSE  |
+///   | --------------   snd ACK   |                           ------- |
+///   V        x                   V                           snd FIN V
+/// +---------+                  +---------+                   +---------+
+/// |FINWAIT-2|                  | CLOSING |                   | LAST-ACK|
+/// +---------+                  +---------+                   +---------+
+///   |                rcv ACK of FIN |                 rcv ACK of FIN |
+///   |  rcv FIN       -------------- |    Timeout=2MSL -------------- |
+///   |  -------              x       V    ------------        x       V
+///    \ snd ACK                 +---------+delete TCB         +---------+
+///     ------------------------>|TIME WAIT|------------------>| CLOSED  |
+///                              +---------+                   +---------+
+#[derive(Debug, Clone)]
 pub enum Connection {
     Closed,
     Listen(ListenerState),
     Active(ActiveSocket),
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Clone, Copy)]
 pub struct ListenerState {}
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ActiveSocket {
     state: ActiveState,
     send: SendSequenceSpace,
     recv: RecvSequenceSpace,
+    ip: Ipv4Header,
+    tcp: TcpHeader,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub enum ActiveState {
     SynSent,
     SynRcvd,
@@ -42,7 +93,7 @@ pub enum ActiveState {
 ///
 ///                   Send Sequence Space
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct SendSequenceSpace {
     /// send unacknowledged
     una: u32,
@@ -74,7 +125,7 @@ struct SendSequenceSpace {
 ///
 ///                  Receive Sequence Space
 /// ```
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct RecvSequenceSpace {
     /// receive next
     nxt: u32,
@@ -98,11 +149,35 @@ impl Connection {
         }
 
         let iss = 0;
+        // snd syn,ack -> syn rcvd
+        let mut syn_ack = TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, 10);
+        syn_ack.acknowledgment_number = tcph.sequence_number() + 1;
+        syn_ack.syn = true;
+        syn_ack.ack = true;
+
+        let Ok(mut ip) = Ipv4Header::new(
+            syn_ack.header_len_u16(),
+            64,
+            IpNumber::TCP,
+            iph.destination(),
+            iph.source(),
+        ) else {
+            eprintln!("ipv4 header new error");
+            return Ok(None);
+        };
+        ip.set_payload_len(syn_ack.header_len() + 0)
+            .expect("set payload len fail");
+
+        // kernel is nice and does this for us
+        // syn_ack.checksum = syn_ack
+        //     .calc_checksum_ipv4(&ip, &[])
+        //     .expect("failed to compute sum");
+
         let mut c = Connection::Active(ActiveSocket {
             state: ActiveState::SynRcvd,
             send: SendSequenceSpace {
                 una: iss,
-                nxt: iss + 1,
+                nxt: iss,
                 wnd: 10,
                 up: false,
                 wl1: 0,
@@ -115,31 +190,11 @@ impl Connection {
                 up: false,
                 irs: tcph.sequence_number(),
             },
+            ip,
+            tcp: syn_ack,
         });
 
-        // snd syn,ack -> syn rcvd
-        let mut syn_ack = TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, 10);
-        syn_ack.acknowledgment_number = tcph.sequence_number() + 1;
-        syn_ack.syn = true;
-        syn_ack.ack = true;
-        let Ok(ip) = Ipv4Header::new(
-            syn_ack.header_len_u16(),
-            64,
-            IpNumber::TCP,
-            iph.destination(),
-            iph.source(),
-        ) else {
-            eprintln!("ipv4 header new error");
-            return Ok(None);
-        };
-        let mut buf = [0u8; 1500];
-        let unwritten = {
-            let mut unwritten = &mut buf[..];
-            ip.write(&mut unwritten);
-            syn_ack.write(&mut unwritten);
-            unwritten.len()
-        };
-        nic.send(&buf[..buf.len() - unwritten]);
+        c.write(nic, &[])?;
         Ok(Some(c))
     }
 
@@ -149,8 +204,160 @@ impl Connection {
         iph: Ipv4HeaderSlice<'a>,
         tcph: TcpHeaderSlice<'a>,
         data: &'a [u8],
-    ) -> io::Result<usize> {
-        Ok(0)
+    ) -> io::Result<()> {
+        let result: io::Result<()> = match self {
+            Connection::Closed => Ok(()),
+            Connection::Listen(_) => Ok(()),
+            Connection::Active(ActiveSocket {
+                state,
+                send,
+                recv,
+                ip,
+                tcp,
+            }) => {
+                // acceptable ack check, remember wrapping
+                // SND.UNA < SEG.ACK =< SND.NXT
+                let ackn = tcph.acknowledgment_number();
+                let ack_diff = ackn.wrapping_sub(send.una);
+                let win_size = send.nxt.wrapping_sub(send.una);
+
+                if ack_diff > 0 && ack_diff <= win_size {
+                    // all good
+                } else {
+                    // violated
+                    if !self.is_synchronized() {
+                        // we should send a reset
+                        self.send_rst(nic);
+                    }
+                    return Ok(());
+                }
+
+                let seqn = tcph.sequence_number();
+                let mut slen = data.len() as u32;
+                if tcph.fin() {
+                    slen += 1;
+                }
+                if tcph.syn() {
+                    slen += 1;
+                }
+                let wnd = recv.wnd as u32;
+
+                if slen == 0 {
+                    if wnd == 0 {
+                        if seqn != recv.nxt {
+                            return Ok(());
+                        }
+                    } else {
+                        let offset = seqn.wrapping_sub(recv.nxt);
+                        if offset >= wnd {
+                            return Ok(());
+                        }
+                    }
+                } else {
+                    if wnd == 0 {
+                        return Ok(());
+                    } else {
+                        let seq_end = seqn.wrapping_add(slen).wrapping_sub(1);
+                        let start_offset = seqn.wrapping_sub(recv.nxt);
+                        let end_offset = seq_end.wrapping_sub(recv.nxt);
+                        if !(start_offset < wnd || end_offset < wnd || end_offset < start_offset) {
+                            return Ok(());
+                        }
+                    }
+                }
+
+                match state {
+                    ActiveState::SynRcvd => {
+                        // expect to get a ack for our SYN
+                        if !tcph.ack() {
+                            return Ok(());
+                        }
+
+                        *state = ActiveState::Estab;
+
+                        unimplemented!()
+                    }
+                    ActiveState::Estab => {
+                        unimplemented!()
+                    }
+                    _ => {
+                        unimplemented!()
+                    }
+                };
+            }
+        };
+        Ok(())
+    }
+
+    fn is_synchronized(&self) -> bool {
+        match self {
+            Connection::Listen(_) => false,
+            Connection::Active(s) => {
+                !matches!(s.state, ActiveState::SynSent | ActiveState::SynRcvd)
+            }
+            _ => true,
+        }
+    }
+
+    fn write(&mut self, nic: &Iface, payload: &[u8]) -> io::Result<usize> {
+        match self {
+            Connection::Closed => Ok(0),
+            Connection::Listen(_) => Ok(0),
+            Connection::Active(ActiveSocket {
+                state,
+                send,
+                recv,
+                ip,
+                tcp,
+            }) => {
+                tcp.sequence_number = send.nxt;
+                tcp.acknowledgment_number = recv.nxt;
+
+                ip.set_payload_len(tcp.header_len() + payload.len())
+                    .unwrap();
+
+                let mut buf = [0u8; 1500];
+                let mut unwritten = &mut buf[..];
+
+                ip.write(&mut unwritten)?;
+                tcp.write(&mut unwritten)?;
+
+                unwritten.write_all(payload)?;
+                let unwritten = unwritten.len();
+
+                send.nxt = send.nxt.wrapping_add(payload.len() as u32);
+                if tcp.syn {
+                    send.nxt = send.nxt.wrapping_add(1);
+                    tcp.syn = false;
+                }
+                if tcp.fin {
+                    send.nxt = send.nxt.wrapping_add(1);
+                    tcp.fin = false;
+                }
+
+                nic.send(&buf[..buf.len() - unwritten])
+            }
+        }
+    }
+
+    fn send_rst(&mut self, nic: &Iface) -> io::Result<()> {
+        match self {
+            Connection::Closed => unreachable!(),
+            Connection::Listen(_) => Ok(()),
+            Connection::Active(ActiveSocket {
+                state,
+                send,
+                recv,
+                ip,
+                tcp,
+            }) => {
+                tcp.rst = true;
+                tcp.sequence_number = 0;
+                tcp.acknowledgment_number = 0;
+                ip.set_payload_len(tcp.header_len());
+                unimplemented!()
+            }
+        }
     }
 }
 
