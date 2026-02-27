@@ -1,4 +1,5 @@
 use std::{
+    cmp::min,
     io::{self, Write},
     net::Ipv4Addr,
 };
@@ -76,6 +77,12 @@ pub enum ActiveState {
     SynSent,
     SynRcvd,
     Estab,
+    FinWait1,
+    FinWait2,
+    TimeWait,
+    CloseWait,
+    LastAck,
+    Closing,
 }
 
 /// ```text
@@ -151,7 +158,7 @@ impl Connection {
         let iss = 0;
         // snd syn,ack -> syn rcvd
         let mut syn_ack = TcpHeader::new(tcph.destination_port(), tcph.source_port(), iss, 10);
-        syn_ack.acknowledgment_number = tcph.sequence_number() + 1;
+        syn_ack.acknowledgment_number = tcph.sequence_number().wrapping_add(1);
         syn_ack.syn = true;
         syn_ack.ack = true;
 
@@ -168,11 +175,6 @@ impl Connection {
         ip.set_payload_len(syn_ack.header_len() + 0)
             .expect("set payload len fail");
 
-        // kernel is nice and does this for us
-        // syn_ack.checksum = syn_ack
-        //     .calc_checksum_ipv4(&ip, &[])
-        //     .expect("failed to compute sum");
-
         let mut c = Connection::Active(ActiveSocket {
             state: ActiveState::SynRcvd,
             send: SendSequenceSpace {
@@ -185,7 +187,7 @@ impl Connection {
                 iss,
             },
             recv: RecvSequenceSpace {
-                nxt: tcph.sequence_number() + 1,
+                nxt: tcph.sequence_number().wrapping_add(1),
                 wnd: tcph.window_size(),
                 up: false,
                 irs: tcph.sequence_number(),
@@ -194,7 +196,7 @@ impl Connection {
             tcp: syn_ack,
         });
 
-        c.write(nic, &[])?;
+        c.write_data(nic, &[])?;
         Ok(Some(c))
     }
 
@@ -217,21 +219,6 @@ impl Connection {
             }) => {
                 // acceptable ack check, remember wrapping
                 // SND.UNA < SEG.ACK =< SND.NXT
-                let ackn = tcph.acknowledgment_number();
-                let ack_diff = ackn.wrapping_sub(send.una);
-                let win_size = send.nxt.wrapping_sub(send.una);
-
-                if ack_diff > 0 && ack_diff <= win_size {
-                    // all good
-                } else {
-                    // violated
-                    if !self.is_synchronized() {
-                        // we should send a reset
-                        self.send_rst(nic);
-                    }
-                    return Ok(());
-                }
-
                 let seqn = tcph.sequence_number();
                 let mut slen = data.len() as u32;
                 if tcph.fin() {
@@ -240,6 +227,23 @@ impl Connection {
                 if tcph.syn() {
                     slen += 1;
                 }
+
+                let ackn = tcph.acknowledgment_number();
+                let ack_diff = ackn.wrapping_sub(send.una);
+                let win_size = send.nxt.wrapping_sub(send.una);
+
+                if ack_diff <= win_size {
+                    // all good
+                } else {
+                    // violated
+                    if !self.is_synchronized() {
+                        // we should send a reset
+                        return self.send_rst(nic, tcph, slen);
+                    }
+                    // BOGUS: send a empty ack
+                    return Ok(());
+                }
+
                 let wnd = recv.wnd as u32;
 
                 if slen == 0 {
@@ -292,6 +296,7 @@ impl Connection {
     fn is_synchronized(&self) -> bool {
         match self {
             Connection::Listen(_) => false,
+            Connection::Closed => false,
             Connection::Active(s) => {
                 !matches!(s.state, ActiveState::SynSent | ActiveState::SynRcvd)
             }
@@ -299,7 +304,7 @@ impl Connection {
         }
     }
 
-    fn write(&mut self, nic: &Iface, payload: &[u8]) -> io::Result<usize> {
+    fn write_data(&mut self, nic: &Iface, payload: &[u8]) -> io::Result<usize> {
         match self {
             Connection::Closed => Ok(0),
             Connection::Listen(_) => Ok(0),
@@ -313,17 +318,7 @@ impl Connection {
                 tcp.sequence_number = send.nxt;
                 tcp.acknowledgment_number = recv.nxt;
 
-                ip.set_payload_len(tcp.header_len() + payload.len())
-                    .unwrap();
-
-                let mut buf = [0u8; 1500];
-                let mut unwritten = &mut buf[..];
-
-                ip.write(&mut unwritten)?;
-                tcp.write(&mut unwritten)?;
-
-                unwritten.write_all(payload)?;
-                let unwritten = unwritten.len();
+                let sent = transmit_tcp_packet(nic, ip, tcp, payload)?;
 
                 send.nxt = send.nxt.wrapping_add(payload.len() as u32);
                 if tcp.syn {
@@ -334,13 +329,17 @@ impl Connection {
                     send.nxt = send.nxt.wrapping_add(1);
                     tcp.fin = false;
                 }
-
-                nic.send(&buf[..buf.len() - unwritten])
+                return Ok(sent);
             }
         }
     }
 
-    fn send_rst(&mut self, nic: &Iface) -> io::Result<()> {
+    fn send_rst<'a>(
+        &mut self,
+        nic: &Iface,
+        incoming_tcph: TcpHeaderSlice<'a>,
+        incoming_slen: u32,
+    ) -> io::Result<()> {
         match self {
             Connection::Closed => unreachable!(),
             Connection::Listen(_) => Ok(()),
@@ -351,11 +350,26 @@ impl Connection {
                 ip,
                 tcp,
             }) => {
-                tcp.rst = true;
-                tcp.sequence_number = 0;
-                tcp.acknowledgment_number = 0;
-                ip.set_payload_len(tcp.header_len());
-                unimplemented!()
+                let mut rst_tcp = tcp.clone();
+
+                rst_tcp.rst = true;
+                rst_tcp.syn = false;
+                rst_tcp.fin = false;
+                rst_tcp.ack = true;
+
+                // BOGUS: if incoming packet has ack, rst_tcp.seq = incoming.ack, else
+                // rst_tcp.seq = 0, rst_tcp.ack = incoming.seq + incoming.len()
+                if incoming_tcph.ack() {
+                    rst_tcp.sequence_number = incoming_tcph.acknowledgment_number();
+                } else {
+                    rst_tcp.sequence_number = 0;
+                    rst_tcp.acknowledgment_number = incoming_tcph.sequence_number() + incoming_slen;
+                }
+                rst_tcp.sequence_number = send.nxt;
+                rst_tcp.acknowledgment_number = recv.nxt;
+
+                transmit_tcp_packet(nic, ip, &mut rst_tcp, &[])?;
+                Ok(())
             }
         }
     }
@@ -365,4 +379,32 @@ impl Connection {
 pub struct Quad {
     pub src: (Ipv4Addr, u16),
     pub dst: (Ipv4Addr, u16),
+}
+
+fn transmit_tcp_packet(
+    nic: &Iface,
+    ip: &mut Ipv4Header,
+    tcp: &mut TcpHeader,
+    payload: &[u8],
+) -> io::Result<usize> {
+    let mut buf = [0u8; 1500];
+    let ip_payload_len = min(
+        tcp.header_len() + payload.len(),
+        buf.len() - ip.header_len(),
+    );
+    ip.set_payload_len(ip_payload_len).unwrap();
+    tcp.checksum = tcp
+        .calc_checksum_ipv4(ip, payload)
+        .expect("checksum calc failed");
+
+    let unwritten = {
+        let mut unwritten = &mut buf[..];
+        ip.write(&mut unwritten)?;
+        tcp.write(&mut unwritten)?;
+        unwritten.write_all(payload)?;
+        unwritten.len()
+    };
+
+    let written_len = buf.len() - unwritten;
+    nic.send(&buf[..written_len])
 }
