@@ -236,9 +236,11 @@ impl Connection {
                     // all good
                 } else {
                     // violated
-                    if !self.is_synchronized() {
+                    let synchronized =
+                        !matches!(state, ActiveState::SynSent | ActiveState::SynRcvd);
+                    if !synchronized {
                         // we should send a reset
-                        return self.send_rst(nic, tcph, slen);
+                        return Self::send_rst_active(nic, ip, tcp, tcph, slen);
                     }
                     // BOGUS: send a empty ack
                     return Ok(());
@@ -279,9 +281,20 @@ impl Connection {
 
                         *state = ActiveState::Estab;
 
+                        // now lets terminate the conneection
+                        tcp.fin = true;
+                        Self::write_data_active(nic, send, recv, ip, tcp, &[])?;
+                        *state = ActiveState::FinWait1;
+
                         unimplemented!()
                     }
                     ActiveState::Estab => {
+                        if !tcph.fin() || !data.is_empty() {
+                            unimplemented!()
+                        }
+                        // ack the fin
+                        Self::write_data_active(nic, send, recv, ip, tcp, &[])?;
+                        *state = ActiveState::CloseWait;
                         unimplemented!()
                     }
                     _ => {
@@ -304,33 +317,71 @@ impl Connection {
         }
     }
 
+    fn write_data_active(
+        nic: &Iface,
+        send: &mut SendSequenceSpace,
+        recv: &mut RecvSequenceSpace,
+        ip: &mut Ipv4Header,
+        tcp: &mut TcpHeader,
+        payload: &[u8],
+    ) -> io::Result<usize> {
+        tcp.sequence_number = send.nxt;
+        tcp.acknowledgment_number = recv.nxt;
+
+        let sent = transmit_tcp_packet(nic, ip, tcp, payload)?;
+
+        send.nxt = send.nxt.wrapping_add(payload.len() as u32);
+        if tcp.syn {
+            send.nxt = send.nxt.wrapping_add(1);
+            tcp.syn = false;
+        }
+        if tcp.fin {
+            send.nxt = send.nxt.wrapping_add(1);
+            tcp.fin = false;
+        }
+        Ok(sent)
+    }
+
+    fn send_rst_active<'a>(
+        nic: &Iface,
+        ip: &mut Ipv4Header,
+        tcp: &TcpHeader,
+        incoming_tcph: TcpHeaderSlice<'a>,
+        incoming_slen: u32,
+    ) -> io::Result<()> {
+        let mut rst_tcp = tcp.clone();
+
+        rst_tcp.rst = true;
+        rst_tcp.syn = false;
+        rst_tcp.fin = false;
+
+        // BOGUS: if incoming packet has ack, rst_tcp.seq = incoming.ack, else
+        // rst_tcp.seq = 0, rst_tcp.ack = incoming.seq + incoming.len()
+        if incoming_tcph.ack() {
+            rst_tcp.sequence_number = incoming_tcph.acknowledgment_number();
+            rst_tcp.ack = false;
+        } else {
+            rst_tcp.sequence_number = 0;
+            rst_tcp.acknowledgment_number =
+                incoming_tcph.sequence_number().wrapping_add(incoming_slen);
+            rst_tcp.ack = true;
+        }
+
+        transmit_tcp_packet(nic, ip, &mut rst_tcp, &[])?;
+        Ok(())
+    }
+
     fn write_data(&mut self, nic: &Iface, payload: &[u8]) -> io::Result<usize> {
         match self {
             Connection::Closed => Ok(0),
             Connection::Listen(_) => Ok(0),
             Connection::Active(ActiveSocket {
-                state,
                 send,
                 recv,
                 ip,
                 tcp,
-            }) => {
-                tcp.sequence_number = send.nxt;
-                tcp.acknowledgment_number = recv.nxt;
-
-                let sent = transmit_tcp_packet(nic, ip, tcp, payload)?;
-
-                send.nxt = send.nxt.wrapping_add(payload.len() as u32);
-                if tcp.syn {
-                    send.nxt = send.nxt.wrapping_add(1);
-                    tcp.syn = false;
-                }
-                if tcp.fin {
-                    send.nxt = send.nxt.wrapping_add(1);
-                    tcp.fin = false;
-                }
-                return Ok(sent);
-            }
+                ..
+            }) => Self::write_data_active(nic, send, recv, ip, tcp, payload),
         }
     }
 
@@ -343,32 +394,8 @@ impl Connection {
         match self {
             Connection::Closed => unreachable!(),
             Connection::Listen(_) => Ok(()),
-            Connection::Active(ActiveSocket {
-                state,
-                send,
-                recv,
-                ip,
-                tcp,
-            }) => {
-                let mut rst_tcp = tcp.clone();
-
-                rst_tcp.rst = true;
-                rst_tcp.syn = false;
-                rst_tcp.fin = false;
-
-                // BOGUS: if incoming packet has ack, rst_tcp.seq = incoming.ack, else
-                // rst_tcp.seq = 0, rst_tcp.ack = incoming.seq + incoming.len()
-                if incoming_tcph.ack() {
-                    rst_tcp.sequence_number = incoming_tcph.acknowledgment_number();
-                    rst_tcp.ack = false;
-                } else {
-                    rst_tcp.sequence_number = 0;
-                    rst_tcp.acknowledgment_number = incoming_tcph.sequence_number() + incoming_slen;
-                    rst_tcp.ack = true;
-                }
-
-                transmit_tcp_packet(nic, ip, &mut rst_tcp, &[])?;
-                Ok(())
+            Connection::Active(ActiveSocket { ip, tcp, .. }) => {
+                Self::send_rst_active(nic, ip, tcp, incoming_tcph, incoming_slen)
             }
         }
     }
