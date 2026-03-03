@@ -60,7 +60,7 @@ pub enum Connection {
     Active(ActiveSocket),
 }
 
-#[derive(Default, Debug, Clone, Copy)]
+#[derive(Default, Debug, Clone)]
 pub struct ListenerState {}
 
 #[derive(Debug, Clone)]
@@ -72,7 +72,7 @@ pub struct ActiveSocket {
     tcp: TcpHeader,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub enum ActiveState {
     SynSent,
     SynRcvd,
@@ -100,7 +100,7 @@ pub enum ActiveState {
 ///
 ///                   Send Sequence Space
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct SendSequenceSpace {
     /// send unacknowledged
     una: u32,
@@ -132,7 +132,7 @@ struct SendSequenceSpace {
 ///
 ///                  Receive Sequence Space
 /// ```
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RecvSequenceSpace {
     /// receive next
     nxt: u32,
@@ -355,18 +355,17 @@ impl Connection {
                 rst_tcp.rst = true;
                 rst_tcp.syn = false;
                 rst_tcp.fin = false;
-                rst_tcp.ack = true;
 
                 // BOGUS: if incoming packet has ack, rst_tcp.seq = incoming.ack, else
                 // rst_tcp.seq = 0, rst_tcp.ack = incoming.seq + incoming.len()
                 if incoming_tcph.ack() {
                     rst_tcp.sequence_number = incoming_tcph.acknowledgment_number();
+                    rst_tcp.ack = false;
                 } else {
                     rst_tcp.sequence_number = 0;
                     rst_tcp.acknowledgment_number = incoming_tcph.sequence_number() + incoming_slen;
+                    rst_tcp.ack = true;
                 }
-                rst_tcp.sequence_number = send.nxt;
-                rst_tcp.acknowledgment_number = recv.nxt;
 
                 transmit_tcp_packet(nic, ip, &mut rst_tcp, &[])?;
                 Ok(())
@@ -375,7 +374,7 @@ impl Connection {
     }
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
 pub struct Quad {
     pub src: (Ipv4Addr, u16),
     pub dst: (Ipv4Addr, u16),
