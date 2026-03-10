@@ -34,20 +34,20 @@
               pkg-config
               openssl
               mold
-              sccache
+              # sccache
             ]
             ++ pkgs.lib.optionals pkgs.stdenv.isDarwin [
               # macOS 特有的依赖
               libiconv
-              darwin.apple_sdk.frameworks.Security
-              darwin.apple_sdk.frameworks.SystemConfiguration
+              # darwin.apple_sdk.frameworks.Security
+              # darwin.apple_sdk.frameworks.SystemConfiguration
             ];
 
           RUST_SRC_PATH = "${rustToolchain}/lib/rustlib/src/rust/library";
 
-          RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
-          SCCACHE_CACHE_SIZE = "10G";
-          SCCACHE_DIR = "/data/builds/sccache";
+          # RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+          # SCCACHE_CACHE_SIZE = "10G";
+          # SCCACHE_DIR = "/data/builds/sccache";
 
           shellHook = ''
             echo "Rust version: $(rustc --version)"
